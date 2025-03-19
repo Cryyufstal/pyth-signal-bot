@@ -1,72 +1,78 @@
 import ccxt
-import ta
-import numpy as np
-import telebot
-import time
 import pandas as pd
+import time
+import requests
+from ta.trend import MACD
 
-# إعدادات Binance API
-exchange = ccxt.okx()
-SYMBOLS = ['ETH/USDT', 'ADA/USDT', 'XRP/USDT']
-RSI_PERIOD = 14
-MACD_FAST = 12
-MACD_SLOW = 26
-MACD_SIGNAL = 9
+# إعدادات تيليجرام
+TELEGRAM_TOKEN = '7679583380:AAFzYwz9FKmrKmas6sE1oOZwTcQoMvgHRDY'
+CHAT_ID = '7767987992'
 
-# إعدادات Telegram
-TELEGRAM_BOT_TOKEN = "7318761843:AAH_px4QlkQgrtoVohxy8b0Gs80WzJA9ieU"
-CHAT_ID = "6973330942"
-bot = telebot.TeleBot(TELEGRAM_BOT_TOKEN)
+def send_telegram_message(message):
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    payload = {"chat_id": CHAT_ID, "text": message}
+    try:
+        requests.post(url, data=payload)
+    except Exception as e:
+        print(f"Error sending message: {e}")
 
-# إرسال رسالة عند تشغيل البوت
-bot.send_message(CHAT_ID, "🚀 بوت التداول بدأ العمل! سيتم إرسال إشعارات عند تحقق الشروط.")
+# تحميل البيانات
+def fetch_latest_data(symbol="ETH/USDT", timeframe="5m", limit=100, exchange_name="kucoin"):
+    exchange = getattr(ccxt, exchange_name)()
+    ohlcv = exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
+    df = pd.DataFrame(ohlcv, columns=["timestamp", "open", "high", "low", "close", "volume"])
+    df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
+    df.set_index("timestamp", inplace=True)
+    return df
 
-def get_candles(symbol, timeframe='1m', limit=100):
-    """جلب بيانات الأسعار"""
-    candles = exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
-    if not candles or len(candles) < 50:  # التحقق من البيانات
-        return None
-    close_prices = np.array([candle[4] for candle in candles], dtype=np.float64)
-    return close_prices
+# حساب MACD
+def apply_macd(df):
+    macd = MACD(df["close"], window_slow=26, window_fast=12, window_sign=9)
+    df["MACD"] = macd.macd()
+    df["MACD_signal"] = macd.macd_signal()
+    return df
 
-def calculate_rsi(prices, period=14):
-    """حساب مؤشر القوة النسبية (RSI)"""
-    if prices is None or len(prices) < period:
-        return None
-    df = pd.DataFrame({'close': prices})
-    rsi = ta.momentum.RSIIndicator(df['close'], window=period).rsi().iloc[-1]
-    return rsi  # ✅ إصلاح الخطأ بإضافة return
+# العملات التي نراقبها
+symbols = ["ETH/USDT", "ADA/USDT", "XRP/USDT"]
 
-def calculate_macd(prices, fast=12, slow=26, signal=9):
-    """حساب مؤشر MACD"""
-    if prices is None or len(prices) < slow:
-        return None, None
-    df = pd.DataFrame({'close': prices})
-    macd_indicator = ta.trend.MACD(df['close'], window_slow=slow, window_fast=fast, window_sign=signal)
-    return macd_indicator.macd().iloc[-1], macd_indicator.macd_signal().iloc[-1]  # ✅ إصلاح الخطأ بإضافة return
+# تخزين آخر إشارة لكل عملة
+last_signals = {symbol: None for symbol in symbols}
 
+# بدء الحلقة المستمرة
 while True:
-    for symbol in SYMBOLS:
+    for symbol in symbols:
         try:
-            prices = get_candles(symbol)
+            print(f"\nChecking {symbol}...")
+            df = fetch_latest_data(symbol=symbol, timeframe="5m", limit=100)
+            df = apply_macd(df)
 
-            if prices is None:
-                print(f"⚠️ لا توجد بيانات كافية لـ {symbol}")
-                continue  # تخطي هذه العملة
+            # التأكد من وجود بيانات كافية
+            if len(df) >= 2:
+                macd_now = df["MACD"].iloc[-1]
+                signal_now = df["MACD_signal"].iloc[-1]
+                macd_prev = df["MACD"].iloc[-2]
+                signal_prev = df["MACD_signal"].iloc[-2]
 
-            rsi = calculate_rsi(prices, RSI_PERIOD)
-            macd, signal = calculate_macd(prices, MACD_FAST, MACD_SLOW, MACD_SIGNAL)
+                # تقاطع لأعلى = LONG
+                if macd_now > signal_now and macd_prev <= signal_prev and last_signals[symbol] != "BUY":
+                    price = df["close"].iloc[-1]
+                    send_telegram_message(f"🚀 LONG Signal!\nSymbol: {symbol}\nEntry Price: {price:.4f}\nTime: {df.index[-1]}")
+                    print(f"Sent LONG signal for {symbol}")
+                    last_signals[symbol] = "BUY"
 
-            if rsi is None or macd is None or signal is None:
-                print(f"⚠️ البيانات غير كافية لحساب RSI أو MACD لـ {symbol}")
-                continue  
+                # تقاطع لأسفل = SHORT
+                elif macd_now < signal_now and macd_prev >= signal_prev and last_signals[symbol] != "SELL":
+                    price = df["close"].iloc[-1]
+                    send_telegram_message(f"🔻 SHORT Signal!\nSymbol: {symbol}\nEntry Price: {price:.4f}\nTime: {df.index[-1]}")
+                    print(f"Sent SHORT signal for {symbol}")
+                    last_signals[symbol] = "SELL"
 
-            if rsi < 30 and macd > signal:  # إشارة شراء
-                bot.send_message(CHAT_ID, f'🔔 شراء محتمل: {symbol}\nRSI: {rsi:.2f}, MACD: {macd:.4f}')
-            elif rsi > 70 and macd < signal:  # إشارة بيع
-                bot.send_message(CHAT_ID, f'⚠️ بيع محتمل: {symbol}\nRSI: {rsi:.2f}, MACD: {macd:.4f}')
-        
+                else:
+                    print(f"No signal for {symbol} at {df.index[-1]}")
+
         except Exception as e:
-            print(f"⚠️ خطأ في {symbol}: {e}")
-    
-    time.sleep(60)  # انتظار دقيقة بين الفحوصات
+            print(f"Error fetching/analyzing {symbol}: {e}")
+
+    # الانتظار حتى الشمعة التالية (5 دقائق = 300 ثانية)
+    print("\nWaiting for next update...")
+    time.sleep(300)
